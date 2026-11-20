@@ -176,7 +176,7 @@ esac
   const hub = {
     nextCard: () => new Promise((resolve) => stop.signal.addEventListener("abort", () => resolve({ card: null }))),
   };
-  setTimeout(() => stop.abort(), 1_500);
+  setTimeout(() => stop.abort(), 2_800);
   const started = Date.now();
   await feishu({
     hub: hub as any,
