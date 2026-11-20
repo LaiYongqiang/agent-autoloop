@@ -18,14 +18,20 @@ import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { after, test } from "node:test";
+import { test } from "node:test";
 import feishu, { render } from "../plugins/feishu/channel.ts";
 import webhook from "../plugins/webhook/channel.ts";
 import github from "../plugins/github/source.ts";
 import type { Card } from "../host/channels.ts";
 
-const dir = mkdtempSync(join(tmpdir(), "agent-autoloop-channels-"));
-after(() => rmSync(dir, { recursive: true, force: true }));
+async function withTempDir<T>(fn: (testDir: string) => Promise<T> | T): Promise<T> {
+  const testDir = mkdtempSync(join(tmpdir(), "agent-autoloop-channels-"));
+  try {
+    return await fn(testDir);
+  } finally {
+    rmSync(testDir, { recursive: true, force: true });
+  }
+}
 
 const base: Card = {
   id: 5,
@@ -90,17 +96,18 @@ test("a card shows its options while it's open, and what became of it after", ()
 });
 
 test("feishu CLI calls leave the HTTP loop available", async () => {
-  let requests = 0;
-  const server = createServer((_req, res) => {
-    requests++;
-    res.end("ok");
-  });
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-  const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
-  const lark = join(dir, "async-lark");
-  writeFileSync(
-    lark,
-    `#!${process.execPath}
+  await withTempDir(async (dir) => {
+    let requests = 0;
+    const server = createServer((_req, res) => {
+      requests++;
+      res.end("ok");
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    const lark = join(dir, "async-lark");
+    writeFileSync(
+      lark,
+      `#!${process.execPath}
 if (process.argv[2] === 'event') { setInterval(() => {}, 1000); }
 else {
   (async () => {
@@ -110,58 +117,62 @@ else {
   })().catch(() => process.exit(1));
 }
 `,
-    { mode: 0o755 },
-  );
-  const stop = new AbortController();
-  const cards = [base, { ...base, version: 2, ref: "om_5" }];
-  let delivered = 0;
-  const failed: unknown[] = [];
-  const hub = {
-    async nextCard() {
-      const card = cards.shift() ?? null;
-      if (!card) stop.abort();
-      return { card };
-    },
-    async delivered() {
-      delivered++;
-    },
-    async failed(...args: unknown[]) {
-      failed.push(args);
-    },
-  };
-  try {
-    await feishu({ hub: hub as any, options: { lark }, log: () => {}, signal: stop.signal });
-    assert.deepEqual(failed, []);
-    assert.equal(delivered, 2);
-    assert.equal(requests, 3, "user lookup, send and patch each allowed HTTP to respond");
-  } finally {
-    stop.abort();
-    server.closeAllConnections();
-    await new Promise<void>((resolve) => server.close(() => resolve()));
-  }
+      { mode: 0o755 },
+    );
+    const stop = new AbortController();
+    const cards = [base, { ...base, version: 2, ref: "om_5" }];
+    let delivered = 0;
+    const failed: unknown[] = [];
+    const hub = {
+      async nextCard() {
+        const card = cards.shift() ?? null;
+        if (!card) stop.abort();
+        return { card };
+      },
+      async delivered() {
+        delivered++;
+      },
+      async failed(...args: unknown[]) {
+        failed.push(args);
+      },
+    };
+    try {
+      await feishu({ hub: hub as any, options: { lark }, log: () => {}, signal: stop.signal });
+      assert.deepEqual(failed, []);
+      assert.equal(delivered, 2);
+      assert.equal(requests, 3, "user lookup, send and patch each allowed HTTP to respond");
+    } finally {
+      stop.abort();
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
 });
 
 test("feishu: a lark-cli that can't be started is said, not left to take the hub down", async () => {
-  const stop = new AbortController();
-  const lines: string[] = [];
-  const hub = { nextCard: () => new Promise((resolve) => setTimeout(() => resolve({ card: null }), 5)) };
-  const log = (line: string) => {
-    lines.push(line);
-    stop.abort();
-  };
-  // Returning shows the listener's loop went on past the failure, to where it would start again. Without the time limit
-  // a crash, which the test runner catches, would leave this waiting for good.
-  const signal = AbortSignal.any([stop.signal, AbortSignal.timeout(5_000)]);
-  await feishu({ hub: hub as any, options: { user: "ou_me", lark: join(dir, "not-there") }, log, signal });
-  assert.match(lines[0] ?? "", /ENOENT/);
+  await withTempDir(async (dir) => {
+    const stop = new AbortController();
+    const lines: string[] = [];
+    const hub = { nextCard: () => new Promise((resolve) => setTimeout(() => resolve({ card: null }), 5)) };
+    const log = (line: string) => {
+      lines.push(line);
+      stop.abort();
+    };
+    // Returning shows the listener's loop went on past the failure, to where it would start again. Without the time limit
+    // a crash, which the test runner catches, would leave this waiting for good.
+    const signal = AbortSignal.any([stop.signal, AbortSignal.timeout(5_000)]);
+    await feishu({ hub: hub as any, options: { user: "ou_me", lark: join(dir, "not-there") }, log, signal });
+    assert.match(lines[0] ?? "", /ENOENT/);
+  });
 });
 
 test("feishu: a listener Feishu refuses for another connection is explained and tried again slowly", async () => {
-  const calls = join(dir, "lark-refused.log");
-  const lark = join(dir, "lark-cli-refused");
-  writeFileSync(
-    lark,
-    `#!/bin/sh
+  await withTempDir(async (dir) => {
+    const calls = join(dir, "lark-refused.log");
+    const lark = join(dir, "lark-cli-refused");
+    writeFileSync(
+      lark,
+      `#!/bin/sh
 case "$*" in
   *"event consume"*)
     echo consume >> "${calls}"
@@ -169,34 +180,39 @@ case "$*" in
     exit 1 ;;
 esac
 `,
-    { mode: 0o755 },
-  );
-  const stop = new AbortController();
-  const lines: string[] = [];
-  const hub = {
-    nextCard: () => new Promise((resolve) => stop.signal.addEventListener("abort", () => resolve({ card: null }))),
-  };
-  setTimeout(() => stop.abort(), 1_500);
-  const started = Date.now();
-  await feishu({
-    hub: hub as any,
-    options: { user: "ou_me", lark },
-    log: (line) => lines.push(line),
-    signal: stop.signal,
+      { mode: 0o755 },
+    );
+    const stop = new AbortController();
+    const lines: string[] = [];
+    const signal = AbortSignal.any([stop.signal, AbortSignal.timeout(10_000)]);
+    const hub = {
+      nextCard: () => new Promise((resolve) => signal.addEventListener("abort", () => resolve({ card: null }))),
+    };
+    const started = Date.now();
+    await feishu({
+      hub: hub as any,
+      options: { user: "ou_me", lark },
+      log: (line) => {
+        lines.push(line);
+        if (/1 分钟后再试/.test(line)) stop.abort();
+      },
+      signal,
+    });
+    assert.ok(Date.now() - started < 4_000, "stopping doesn't wait out the pause before the next try");
+    assert.equal(readFileSync(calls, "utf8"), "consume\n");
+    const said = lines.join("\n");
+    assert.match(said, /卡片点击收不到/);
+    assert.match(said, /1 分钟后再试/);
+    assert.doesNotMatch(said, /10 seconds/);
   });
-  assert.ok(Date.now() - started < 4_000, "stopping doesn't wait out the pause before the next try");
-  assert.equal(readFileSync(calls, "utf8"), "consume\n");
-  const said = lines.join("\n");
-  assert.match(said, /卡片点击收不到/);
-  assert.match(said, /1 分钟后再试/);
-  assert.doesNotMatch(said, /10 seconds/);
 });
 
 test("feishu: a first card works without lark-cli's stdin content convention", async () => {
-  const lark = join(dir, "lark-cli-no-stdin-content");
-  writeFileSync(
-    lark,
-    `#!/bin/sh
+  await withTempDir(async (dir) => {
+    const lark = join(dir, "lark-cli-no-stdin-content");
+    writeFileSync(
+      lark,
+      `#!/bin/sh
 case "$*" in
   *"event consume"*) exec sleep 30 ;;
   *"+messages-send"*)
@@ -212,39 +228,41 @@ case "$*" in
     esac ;;
 esac
 `,
-    { mode: 0o755 },
-  );
-  const stop = new AbortController();
-  const cards: (Card | null)[] = [base];
-  const delivered: unknown[][] = [];
-  const failed: unknown[][] = [];
-  const hub = {
-    async nextCard() {
-      if (cards.length) return { card: cards.shift()! };
-      stop.abort();
-      return { card: null };
-    },
-    async delivered(...args: unknown[]) {
-      delivered.push(args);
-      return {};
-    },
-    async failed(...args: unknown[]) {
-      failed.push(args);
-      return {};
-    },
-  };
-  await feishu({ hub: hub as any, options: { user: "ou_me", lark }, log: () => {}, signal: stop.signal });
-  assert.deepEqual(failed, []);
-  assert.deepEqual(delivered, [[5, 1, "om_5"]]);
+      { mode: 0o755 },
+    );
+    const stop = new AbortController();
+    const cards: (Card | null)[] = [base];
+    const delivered: unknown[][] = [];
+    const failed: unknown[][] = [];
+    const hub = {
+      async nextCard() {
+        if (cards.length) return { card: cards.shift()! };
+        stop.abort();
+        return { card: null };
+      },
+      async delivered(...args: unknown[]) {
+        delivered.push(args);
+        return {};
+      },
+      async failed(...args: unknown[]) {
+        failed.push(args);
+        return {};
+      },
+    };
+    await feishu({ hub: hub as any, options: { user: "ou_me", lark }, log: () => {}, signal: stop.signal });
+    assert.deepEqual(failed, []);
+    assert.deepEqual(delivered, [[5, 1, "om_5"]]);
+  });
 });
 
 test("feishu: sends once per card, updates in place, reports failure, and only real clicks count", async () => {
-  const log = join(dir, "lark.log");
-  const lark = join(dir, "lark-cli");
-  // A stand-in for lark-cli: records each call; `event consume` prints two clicks and waits to be stopped.
-  writeFileSync(
-    lark,
-    `#!/bin/sh
+  await withTempDir(async (dir) => {
+    const log = join(dir, "lark.log");
+    const lark = join(dir, "lark-cli");
+    // A stand-in for lark-cli: records each call; `event consume` prints two clicks and waits to be stopped.
+    writeFileSync(
+      lark,
+      `#!/bin/sh
 echo "$*" >> "${log}"
 case "$*" in
   *"event consume"*)
@@ -255,75 +273,77 @@ case "$*" in
   *) cat > /dev/null; echo '{"ok":true,"data":{"message_id":"om_5"}}' ;;
 esac
 `,
-  );
-  chmodSync(lark, 0o755);
-  const stop = new AbortController();
-  const cards: (Card | null)[] = [
-    base,
-    { ...base, version: 2, ref: "om_5", state: "decided", choice: 1 },
-    { ...base, id: 6, title: "fail-me", ref: null },
-  ];
-  const calls: unknown[][] = [];
-  const hub = {
-    async nextCard() {
-      if (cards.length) return { card: cards.shift()! };
-      await new Promise((resolve) => setTimeout(resolve, 150));
-      stop.abort();
-      return { card: null };
-    },
-    async delivered(...args: unknown[]) {
-      calls.push(["delivered", ...args]);
-      return {};
-    },
-    async failed(...args: unknown[]) {
-      calls.push(["failed", args[0], args[1]]);
-      return {};
-    },
-    async answer(...args: unknown[]) {
-      calls.push(["answer", ...args]);
-      return { changed: true };
-    },
-  };
-  // A card that can't be sent: lark-cli is told to fail by the words in it.
-  writeFileSync(
-    lark,
-    readFileSync(lark, "utf8").replace(
-      "*fail-me*) exit 1 ;;",
-      '*+messages-send*) case "$*" in *fail-me*) exit 1 ;; esac; echo \'{"ok":true,"data":{"message_id":"om_5"}}\' ;;',
-    ),
-  );
-  await feishu({ hub: hub as any, options: { user: "ou_me", lark }, log: () => {}, signal: stop.signal });
-  const lines = readFileSync(log, "utf8").trim().split("\n");
-  const sends = lines.filter((l) => l.includes("+messages-send"));
-  assert.ok(sends[0].includes("--idempotency-key agent-autoloop-card-5"), "the key doesn't change with the version");
-  assert.ok(sends[0].includes("--user-id ou_me"));
-  assert.ok(
-    lines.some((l) => l.includes("messages patch --message-id om_5")),
-    "an update changes the message that was sent",
-  );
-  assert.deepEqual(
-    calls.find((c) => c[0] === "delivered" && c[2] === 1),
-    ["delivered", 5, 1, "om_5"],
-  );
-  assert.deepEqual(
-    calls.find((c) => c[0] === "delivered" && c[2] === 2),
-    ["delivered", 5, 2, "om_5"],
-  );
-  assert.deepEqual(
-    calls.find((c) => c[0] === "failed"),
-    ["failed", 6, 1],
-  );
-  assert.deepEqual(
-    calls.filter((c) => c[0] === "answer"),
-    [["answer", 5, { choice: 1, by: "ou_me", ref: "om_5" }]],
-  );
+    );
+    chmodSync(lark, 0o755);
+    const stop = new AbortController();
+    const cards: (Card | null)[] = [
+      base,
+      { ...base, version: 2, ref: "om_5", state: "decided", choice: 1 },
+      { ...base, id: 6, title: "fail-me", ref: null },
+    ];
+    const calls: unknown[][] = [];
+    const hub = {
+      async nextCard() {
+        if (cards.length) return { card: cards.shift()! };
+        await new Promise((resolve) => setTimeout(resolve, 150));
+        stop.abort();
+        return { card: null };
+      },
+      async delivered(...args: unknown[]) {
+        calls.push(["delivered", ...args]);
+        return {};
+      },
+      async failed(...args: unknown[]) {
+        calls.push(["failed", args[0], args[1]]);
+        return {};
+      },
+      async answer(...args: unknown[]) {
+        calls.push(["answer", ...args]);
+        return { changed: true };
+      },
+    };
+    // A card that can't be sent: lark-cli is told to fail by the words in it.
+    writeFileSync(
+      lark,
+      readFileSync(lark, "utf8").replace(
+        "*fail-me*) exit 1 ;;",
+        '*+messages-send*) case "$*" in *fail-me*) exit 1 ;; esac; echo \'{"ok":true,"data":{"message_id":"om_5"}}\' ;;',
+      ),
+    );
+    await feishu({ hub: hub as any, options: { user: "ou_me", lark }, log: () => {}, signal: stop.signal });
+    const lines = readFileSync(log, "utf8").trim().split("\n");
+    const sends = lines.filter((l) => l.includes("+messages-send"));
+    assert.ok(sends[0].includes("--idempotency-key agent-autoloop-card-5"), "the key doesn't change with the version");
+    assert.ok(sends[0].includes("--user-id ou_me"));
+    assert.ok(
+      lines.some((l) => l.includes("messages patch --message-id om_5")),
+      "an update changes the message that was sent",
+    );
+    assert.deepEqual(
+      calls.find((c) => c[0] === "delivered" && c[2] === 1),
+      ["delivered", 5, 1, "om_5"],
+    );
+    assert.deepEqual(
+      calls.find((c) => c[0] === "delivered" && c[2] === 2),
+      ["delivered", 5, 2, "om_5"],
+    );
+    assert.deepEqual(
+      calls.find((c) => c[0] === "failed"),
+      ["failed", 6, 1],
+    );
+    assert.deepEqual(
+      calls.filter((c) => c[0] === "answer"),
+      [["answer", 5, { choice: 1, by: "ou_me", ref: "om_5" }]],
+    );
+  });
 });
 
 test("feishu: U+2028 and U+2029 in a handling note don't lose the click", async () => {
-  const lark = join(dir, "lark-cli-separators");
-  writeFileSync(
-    lark,
-    `#!/bin/sh
+  await withTempDir(async (dir) => {
+    const lark = join(dir, "lark-cli-separators");
+    writeFileSync(
+      lark,
+      `#!/bin/sh
 case "$*" in
   *"event consume"*)
     echo '{"action_name":"handling_note_submit_8","action_value":"","form_value":"{\\"note\\":\\"第一行 第二行 第三行\\"}","operator_id":"ou_me","message_id":"om_8"}'
@@ -331,36 +351,38 @@ case "$*" in
   *) cat > /dev/null; echo '{"ok":true,"data":{"message_id":"om_8"}}' ;;
 esac
 `,
-  );
-  chmodSync(lark, 0o755);
-  const stop = new AbortController();
-  const answers: unknown[][] = [];
-  let answered = () => {};
-  const click = new Promise<void>((resolve) => (answered = resolve));
-  const hub = {
-    async nextCard() {
-      // Until the click comes, however busy this machine is, or until it's clear it won't.
-      await Promise.race([click, new Promise((resolve) => setTimeout(resolve, 2_000))]);
-      stop.abort();
-      return { card: null };
-    },
-    async answer(...args: unknown[]) {
-      answers.push(args);
-      answered();
-      return { changed: true };
-    },
-  };
-  await feishu({ hub: hub as any, options: { user: "ou_me", lark }, log: () => {}, signal: stop.signal });
-  assert.deepEqual(answers, [[8, { choice: 0, by: "ou_me", ref: "om_8", text: "第一行 第二行 第三行" }]]);
+    );
+    chmodSync(lark, 0o755);
+    const stop = new AbortController();
+    const answers: unknown[][] = [];
+    let answered = () => {};
+    const click = new Promise<void>((resolve) => (answered = resolve));
+    const hub = {
+      async nextCard() {
+        // Until the click comes, however busy this machine is, or until it's clear it won't.
+        await Promise.race([click, new Promise((resolve) => setTimeout(resolve, 2_000))]);
+        stop.abort();
+        return { card: null };
+      },
+      async answer(...args: unknown[]) {
+        answers.push(args);
+        answered();
+        return { changed: true };
+      },
+    };
+    await feishu({ hub: hub as any, options: { user: "ou_me", lark }, log: () => {}, signal: stop.signal });
+    assert.deepEqual(answers, [[8, { choice: 0, by: "ou_me", ref: "om_8", text: "第一行 第二行 第三行" }]]);
+  });
 });
 
 test("feishu: a form submit carries the handling note, and the button's name finds its card", async () => {
-  const log = join(dir, "lark-note.log");
-  const lark = join(dir, "lark-cli-note");
-  // A form submit has an empty action_value: the card's number is in the button's name, the note in form_value.
-  writeFileSync(
-    lark,
-    `#!/bin/sh
+  await withTempDir(async (dir) => {
+    const log = join(dir, "lark-note.log");
+    const lark = join(dir, "lark-cli-note");
+    // A form submit has an empty action_value: the card's number is in the button's name, the note in form_value.
+    writeFileSync(
+      lark,
+      `#!/bin/sh
 echo "$*" >> "${log}"
 case "$*" in
   *"event consume"*)
@@ -370,47 +392,49 @@ case "$*" in
   *) cat > /dev/null; echo '{"ok":true,"data":{"message_id":"om_7"}}' ;;
 esac
 `,
-  );
-  chmodSync(lark, 0o755);
-  const stop = new AbortController();
-  const cards: (Card | null)[] = [{ ...base, id: 7, kind: "notice", options: [], ref: "om_7" }];
-  const calls: unknown[][] = [];
-  const hub = {
-    async nextCard() {
-      if (cards.length) return { card: cards.shift()! };
-      await new Promise((resolve) => setTimeout(resolve, 150));
-      stop.abort();
-      return { card: null };
-    },
-    async delivered() {
-      return {};
-    },
-    async failed() {
-      return {};
-    },
-    async answer(...args: unknown[]) {
-      calls.push(["answer", ...args]);
-      return { changed: true };
-    },
-  };
-  await feishu({ hub: hub as any, options: { user: "ou_me", lark }, log: () => {}, signal: stop.signal });
-  assert.deepEqual(
-    calls.filter((c) => c[0] === "answer"),
-    [
-      ["answer", 7, { choice: 0, by: "ou_me", ref: "om_7", text: "已回他，下周发视频" }],
-      ["answer", 7, { choice: 0, by: "ou_me", ref: "om_7" }],
-    ],
-    "a submitted note and a plain click both count, the click with no empty text",
-  );
+    );
+    chmodSync(lark, 0o755);
+    const stop = new AbortController();
+    const cards: (Card | null)[] = [{ ...base, id: 7, kind: "notice", options: [], ref: "om_7" }];
+    const calls: unknown[][] = [];
+    const hub = {
+      async nextCard() {
+        if (cards.length) return { card: cards.shift()! };
+        await new Promise((resolve) => setTimeout(resolve, 150));
+        stop.abort();
+        return { card: null };
+      },
+      async delivered() {
+        return {};
+      },
+      async failed() {
+        return {};
+      },
+      async answer(...args: unknown[]) {
+        calls.push(["answer", ...args]);
+        return { changed: true };
+      },
+    };
+    await feishu({ hub: hub as any, options: { user: "ou_me", lark }, log: () => {}, signal: stop.signal });
+    assert.deepEqual(
+      calls.filter((c) => c[0] === "answer"),
+      [
+        ["answer", 7, { choice: 0, by: "ou_me", ref: "om_7", text: "已回他，下周发视频" }],
+        ["answer", 7, { choice: 0, by: "ou_me", ref: "om_7" }],
+      ],
+      "a submitted note and a plain click both count, the click with no empty text",
+    );
+  });
 });
 
 test("feishu: an ask card's text form answers with the words and no choice", async () => {
-  const log = join(dir, "lark-free.log");
-  const lark = join(dir, "lark-cli-free");
-  // A free-text submit has no choice: the words are the answer, and an empty one answers nothing.
-  writeFileSync(
-    lark,
-    `#!/bin/sh
+  await withTempDir(async (dir) => {
+    const log = join(dir, "lark-free.log");
+    const lark = join(dir, "lark-cli-free");
+    // A free-text submit has no choice: the words are the answer, and an empty one answers nothing.
+    writeFileSync(
+      lark,
+      `#!/bin/sh
 echo "$*" >> "${log}"
 case "$*" in
   *"event consume"*)
@@ -420,35 +444,36 @@ case "$*" in
   *) cat > /dev/null; echo '{"ok":true,"data":{"message_id":"om_7"}}' ;;
 esac
 `,
-  );
-  chmodSync(lark, 0o755);
-  const stop = new AbortController();
-  const cards: (Card | null)[] = [{ ...base, id: 7, ref: "om_7" }];
-  const calls: unknown[][] = [];
-  const hub = {
-    async nextCard() {
-      if (cards.length) return { card: cards.shift()! };
-      await new Promise((resolve) => setTimeout(resolve, 150));
-      stop.abort();
-      return { card: null };
-    },
-    async delivered() {
-      return {};
-    },
-    async failed() {
-      return {};
-    },
-    async answer(...args: unknown[]) {
-      calls.push(["answer", ...args]);
-      return { changed: true };
-    },
-  };
-  await feishu({ hub: hub as any, options: { user: "ou_me", lark }, log: () => {}, signal: stop.signal });
-  assert.deepEqual(
-    calls.filter((c) => c[0] === "answer"),
-    [["answer", 7, { by: "ou_me", ref: "om_7", text: "账号 test-ops 密码 s3cret" }]],
-    "the words count without a choice, and an empty submit doesn't answer",
-  );
+    );
+    chmodSync(lark, 0o755);
+    const stop = new AbortController();
+    const cards: (Card | null)[] = [{ ...base, id: 7, ref: "om_7" }];
+    const calls: unknown[][] = [];
+    const hub = {
+      async nextCard() {
+        if (cards.length) return { card: cards.shift()! };
+        await new Promise((resolve) => setTimeout(resolve, 150));
+        stop.abort();
+        return { card: null };
+      },
+      async delivered() {
+        return {};
+      },
+      async failed() {
+        return {};
+      },
+      async answer(...args: unknown[]) {
+        calls.push(["answer", ...args]);
+        return { changed: true };
+      },
+    };
+    await feishu({ hub: hub as any, options: { user: "ou_me", lark }, log: () => {}, signal: stop.signal });
+    assert.deepEqual(
+      calls.filter((c) => c[0] === "answer"),
+      [["answer", 7, { by: "ou_me", ref: "om_7", text: "账号 test-ops 密码 s3cret" }]],
+      "the words count without a choice, and an empty submit doesn't answer",
+    );
+  });
 });
 
 test("a webhook channel posts words and the link once, and has nothing to do for an update", async () => {
@@ -547,12 +572,12 @@ test("GitHub: signed or not taken, and what it says becomes a plain event", () =
 
 /** A Feishu channel handed these cards, with a lark-cli that refuses every update: what it ran, and what it told the hub. */
 async function refusedUpdates(given: Card[]) {
-  const log = join(dir, "lark-patch.log");
-  const lark = join(dir, "lark-patch");
-  rmSync(log, { force: true });
-  writeFileSync(
-    lark,
-    `#!/bin/sh
+  return withTempDir(async (dir) => {
+    const log = join(dir, "lark-patch.log");
+    const lark = join(dir, "lark-patch");
+    writeFileSync(
+      lark,
+      `#!/bin/sh
 echo "$*" >> "${log}"
 case "$*" in
   *"event consume"*) exec sleep 30 ;;
@@ -560,32 +585,33 @@ case "$*" in
   *) cat > /dev/null; echo '{"ok":true,"data":{"message_id":"om_new"}}' ;;
 esac
 `,
-  );
-  chmodSync(lark, 0o755);
-  const stop = new AbortController();
-  const cards: Card[] = [...given];
-  const calls: unknown[][] = [];
-  const hub = {
-    async nextCard() {
-      if (cards.length) return { card: cards.shift()! };
-      stop.abort();
-      return { card: null };
-    },
-    async delivered(...args: unknown[]) {
-      calls.push(["delivered", ...args]);
-      return {};
-    },
-    async failed(id: number, version: number) {
-      calls.push(["failed", id, version]);
-      return {};
-    },
-    async answer(...args: unknown[]) {
-      calls.push(["answer", ...args]);
-      return { changed: true };
-    },
-  };
-  await feishu({ hub: hub as any, options: { user: "ou_me", lark }, log: () => {}, signal: stop.signal });
-  return { lines: readFileSync(log, "utf8").trim().split("\n"), calls };
+    );
+    chmodSync(lark, 0o755);
+    const stop = new AbortController();
+    const cards: Card[] = [...given];
+    const calls: unknown[][] = [];
+    const hub = {
+      async nextCard() {
+        if (cards.length) return { card: cards.shift()! };
+        stop.abort();
+        return { card: null };
+      },
+      async delivered(...args: unknown[]) {
+        calls.push(["delivered", ...args]);
+        return {};
+      },
+      async failed(id: number, version: number) {
+        calls.push(["failed", id, version]);
+        return {};
+      },
+      async answer(...args: unknown[]) {
+        calls.push(["answer", ...args]);
+        return { changed: true };
+      },
+    };
+    await feishu({ hub: hub as any, options: { user: "ou_me", lark }, log: () => {}, signal: stop.signal });
+    return { lines: readFileSync(log, "utf8").trim().split("\n"), calls };
+  });
 }
 
 test("feishu: a settled card that can't be updated is sent again, once for each version", async () => {
